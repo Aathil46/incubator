@@ -6,6 +6,7 @@ import type {
   EmployeePublic,
   EmployeeRole,
   LoginResponse,
+  PasskeyCredentialPublic,
   SessionUser,
 } from '../shared/types';
 
@@ -38,6 +39,45 @@ export const api = {
   getSession: () => requestJson<{ user: SessionUser | null }>('/api/auth/session'),
 
   logout: () => requestJson<{ ok: boolean }>('/api/auth/logout', { method: 'POST' }),
+
+  getPasskeys: () =>
+    requestJson<{ passkeys: PasskeyCredentialPublic[] }>('/api/webauthn/passkeys'),
+
+  getPasskeyRegistrationOptions: () =>
+    requestJson<{ options: Parameters<typeof import('@simplewebauthn/browser').startRegistration>[0]['optionsJSON'] }>(
+      '/api/webauthn/registration/options',
+      { method: 'POST' },
+    ),
+
+  verifyPasskeyRegistration: (challenge: string, response: unknown) =>
+    requestJson<{ passkey: PasskeyCredentialPublic }>('/api/webauthn/registration/verify', {
+      method: 'POST',
+      body: JSON.stringify({ challenge, response }),
+    }),
+
+  deletePasskey: (credentialId: string) =>
+    requestJson<{ ok: boolean }>(
+      `/api/webauthn/passkeys/${encodeURIComponent(credentialId)}`,
+      { method: 'DELETE' },
+    ),
+
+  getPasskeyAuthenticationOptions: () =>
+    requestJson<{ options: Parameters<typeof import('@simplewebauthn/browser').startAuthentication>[0]['optionsJSON'] }>(
+      '/api/webauthn/authentication/options',
+      { method: 'POST' },
+    ),
+
+  verifyPasskeyAuthentication: (challenge: string, response: unknown) =>
+    requestJson<{
+      authenticated: boolean;
+      message: string;
+      user?: SessionUser;
+      decision: 'GRANTED';
+      doorStatus: 'UNLOCKED';
+    }>('/api/webauthn/authentication/verify', {
+      method: 'POST',
+      body: JSON.stringify({ challenge, response }),
+    }),
 
   getActiveEmployees: () =>
     requestJson<{ employees: ActiveEmployeeOption[] }>('/api/employees/active'),

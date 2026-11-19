@@ -1,6 +1,16 @@
 import 'dotenv/config';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import path from 'node:path';
+import {
+  generateAuthenticationOptions,
+  generateRegistrationOptions,
+  verifyAuthenticationResponse,
+  verifyRegistrationResponse,
+} from '@simplewebauthn/server';
+import type {
+  AuthenticationResponseJSON,
+  RegistrationResponseJSON,
+} from '@simplewebauthn/server';
 import type { SessionUser } from './src/shared/types.ts';
 import {
   computeDashboardSummary,
@@ -25,6 +35,31 @@ const SESSION_SECRET: string =
 
 const db = createDatabaseStore();
 let simulationOverriddenLocked = false;
+
+const APP_URL = (process.env.APP_URL || 'http://localhost:3000').replace(/\/$/, '');
+const WEBAUTHN_RP_ID =
+  process.env.WEBAUTHN_RP_ID ||
+  (() => {
+    try {
+      return new URL(APP_URL).hostname;
+    } catch {
+      return 'localhost';
+    }
+  })();
+const WEBAUTHN_ORIGINS = (
+  process.env.WEBAUTHN_ORIGINS ||
+  APP_URL
+)
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+interface PendingWebAuthnChallenge {
+  challenge: string;
+  employeeId?: string;
+  expiresAt: number;
+}
+const pendingWebAuthnChallenges = new Map<string, PendingWebAuthnChallenge>();
 
 function parseCookies(cookieHeader: string | undefined): Record<string, string> {
   if (!cookieHeader) return {};
@@ -129,7 +164,7 @@ async function startServer() {
     res.json({ ok: true });
   });
 
-  app.get('/api/employees/active', requireAuthenticated, async (_req, res, next) => {
+  app.get('/api/employees/active', async (_req, res, next) => {
     try {
       const employees = await db.listActiveEmployees();
       res.json({ employees });

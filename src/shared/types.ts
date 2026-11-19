@@ -52,6 +52,15 @@ export interface SessionUser {
   role: EmployeeRole;
 }
 
+export interface PasskeyCredentialPublic {
+  id: string;
+  credential_id: string;
+  name?: string;
+  created_at: string;
+  last_used_at?: string | null;
+  transports?: string[];
+}
+
 export interface DailyLoginStat {
   date: string;
   label: string;

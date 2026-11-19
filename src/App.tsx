@@ -29,12 +29,14 @@ export default function App() {
 
   const [logsRefreshTrigger, setLogsRefreshTrigger] = useState(0);
 
-  const loadSession = useCallback(async () => {
+  const loadSession = useCallback(async (): Promise<SessionUser | null> => {
     try {
       const res = await api.getSession();
       setSessionUser(res.user);
+      return res.user;
     } catch {
       setSessionUser(null);
+      return null;
     }
   }, []);
 
@@ -73,9 +75,14 @@ export default function App() {
   }, [loadDashboard, loadAccessControl]);
 
   useEffect(() => {
-    loadSession();
-    loadDashboard();
-    loadAccessControl();
+    setDashboardLoading(false);
+    setAccessControlLoading(false);
+    loadSession().then((user) => {
+      if (user) {
+        loadDashboard();
+        loadAccessControl();
+      }
+    });
   }, [loadSession, loadDashboard, loadAccessControl]);
 
   const handleLogout = async () => {
@@ -83,6 +90,10 @@ export default function App() {
       await api.logout();
     } finally {
       setSessionUser(null);
+      setDashboardSummary(null);
+      setDashboardError(null);
+      setAccessControlState(null);
+      setAccessControlError(null);
     }
   };
 
