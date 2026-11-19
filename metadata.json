@@ -1,0 +1,6 @@
+{
+  "name": "Smart Incubator Room – Hospital Access Management System",
+  "description": "Hospital NICU smart incubator room access control, employee authentication, audit logging, and administrator management powered by Supabase PostgreSQL.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
