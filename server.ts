@@ -1,6 +1,17 @@
 import 'dotenv/config';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import path from 'node:path';
+import {
+  generateAuthenticationOptions,
+  generateRegistrationOptions,
+  verifyAuthenticationResponse,
+  verifyRegistrationResponse,
+} from '@simplewebauthn/server';
+import { isoBase64URL } from '@simplewebauthn/server/helpers';
+import type {
+  AuthenticationResponseJSON,
+  RegistrationResponseJSON,
+} from '@simplewebauthn/server';
 import type { SessionUser } from './src/shared/types.ts';
 import {
   computeDashboardSummary,
@@ -25,6 +36,31 @@ const SESSION_SECRET: string =
 
 const db = createDatabaseStore();
 let simulationOverriddenLocked = false;
+
+const APP_URL = (process.env.APP_URL || 'http://localhost:3000').replace(/\/$/, '');
+const WEBAUTHN_RP_ID =
+  process.env.WEBAUTHN_RP_ID ||
+  (() => {
+    try {
+      return new URL(APP_URL).hostname;
+    } catch {
+      return 'localhost';
+    }
+  })();
+const WEBAUTHN_ORIGINS = (
+  process.env.WEBAUTHN_ORIGINS ||
+  APP_URL
+)
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+interface PendingWebAuthnChallenge {
+  challenge: string;
+  employeeId?: string;
+  expiresAt: number;
+}
+const pendingWebAuthnChallenges = new Map<string, PendingWebAuthnChallenge>();
 
 function parseCookies(cookieHeader: string | undefined): Record<string, string> {
   if (!cookieHeader) return {};
@@ -106,6 +142,14 @@ function setSessionCookie(res: Response, token: string): void {
 }
 
 async function startServer() {
+  if (process.env.NODE_ENV === 'production') {
+    if (!/^https:\/\//.test(APP_URL)) {
+      throw new Error('APP_URL must use HTTPS in production for WebAuthn passkeys.');
+    }
+    if (WEBAUTHN_ORIGINS.some((origin) => !/^https:\/\//.test(origin))) {
+      throw new Error('WEBAUTHN_ORIGINS must contain HTTPS origins in production.');
+    }
+  }
   await db.ensureSeeded();
 
   const app = express();
@@ -127,6 +171,283 @@ async function startServer() {
   app.post('/api/auth/logout', (_req, res) => {
     res.clearCookie(SESSION_COOKIE, { path: '/' });
     res.json({ ok: true });
+  });
+
+  app.get('/api/webauthn/passkeys', requireAuthenticated, async (req, res, next) => {
+    try {
+      const sessionUser = (req as Request & { sessionUser?: SessionUser }).sessionUser!;
+      const passkeys = await db.listPasskeys(sessionUser.id);
+      res.json({ passkeys });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/webauthn/registration/options', requireAuthenticated, async (req, res, next) => {
+    try {
+      const sessionUser = (req as Request & { sessionUser?: SessionUser }).sessionUser!;
+      const employee = await db.findEmployeeById(sessionUser.id);
+      if (!employee || !employee.is_active) {
+        res.status(403).json({ error: 'Only active employees can register passkeys.' });
+        return;
+      }
+
+      const existing = await db.listPasskeys(employee.id);
+      const options = await generateRegistrationOptions({
+        rpName: 'Smart Incubator Room',
+        rpID: WEBAUTHN_RP_ID,
+        userName: employee.employee_id,
+        userDisplayName: employee.full_name,
+        userID: new Uint8Array(Buffer.from(employee.id)),
+        attestationType: 'none',
+        authenticatorSelection: {
+          residentKey: 'required',
+          requireResidentKey: true,
+          userVerification: 'required',
+          authenticatorAttachment: 'platform',
+        },
+        excludeCredentials: existing.map((passkey) => ({
+          id: passkey.credential_id,
+          transports: passkey.transports as never[],
+        })),
+      });
+
+      pendingWebAuthnChallenges.set(options.challenge, {
+        challenge: options.challenge,
+        employeeId: employee.id,
+        expiresAt: Date.now() + 5 * 60 * 1000,
+      });
+      res.json({ options });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/webauthn/registration/verify', requireAuthenticated, async (req, res, next) => {
+    try {
+      const sessionUser = (req as Request & { sessionUser?: SessionUser }).sessionUser!;
+      const challenge = typeof req.body?.challenge === 'string' ? req.body.challenge : '';
+      const response = req.body?.response as RegistrationResponseJSON | undefined;
+      const pending = pendingWebAuthnChallenges.get(challenge);
+
+      if (!challenge || !pending || pending.expiresAt < Date.now() || pending.employeeId !== sessionUser.id) {
+        res.status(400).json({ error: 'The passkey registration challenge is missing or expired.' });
+        return;
+      }
+      pendingWebAuthnChallenges.delete(challenge);
+
+      if (!response) {
+        res.status(400).json({ error: 'Passkey registration response is missing.' });
+        return;
+      }
+
+      let verification;
+      try {
+        verification = await verifyRegistrationResponse({
+          response,
+          expectedChallenge: pending.challenge,
+          expectedOrigin: WEBAUTHN_ORIGINS,
+          expectedRPID: WEBAUTHN_RP_ID,
+          requireUserVerification: true,
+        });
+      } catch {
+        res.status(400).json({ error: 'The passkey registration response is invalid.' });
+        return;
+      }
+
+      if (!verification.verified) {
+        res.status(400).json({ error: 'Passkey registration could not be verified.' });
+        return;
+      }
+
+      const credential = verification.registrationInfo.credential;
+      const passkey = await db.storePasskey({
+        employee_id: sessionUser.id,
+        credential_id: credential.id,
+        public_key: isoBase64URL.fromBuffer(credential.publicKey),
+        counter: credential.counter,
+        transports: response.response.transports ?? credential.transports ?? [],
+        device_name: 'Android passkey',
+        backup_eligible: verification.registrationInfo.credentialDeviceType === 'multiDevice',
+        backup_state: verification.registrationInfo.credentialBackedUp,
+      });
+      res.status(201).json({ passkey });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.delete('/api/webauthn/passkeys/:credentialId', requireAuthenticated, async (req, res, next) => {
+    try {
+      const sessionUser = (req as Request & { sessionUser?: SessionUser }).sessionUser!;
+      const credentialId = String(req.params.credentialId ?? '');
+      const deleted = await db.deletePasskey(sessionUser.id, credentialId);
+      if (!deleted) {
+        res.status(404).json({ error: 'Passkey not found.' });
+        return;
+      }
+      res.json({ ok: true });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/webauthn/authentication/options', async (_req, res, next) => {
+    try {
+      const options = await generateAuthenticationOptions({
+        rpID: WEBAUTHN_RP_ID,
+        timeout: 60_000,
+        userVerification: 'required',
+      });
+      pendingWebAuthnChallenges.set(options.challenge, {
+        challenge: options.challenge,
+        expiresAt: Date.now() + 5 * 60 * 1000,
+      });
+      res.json({ options });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/webauthn/authentication/failed', async (req, res, next) => {
+    try {
+      const reason =
+        typeof req.body?.reason === 'string'
+          ? req.body.reason.slice(0, 200)
+          : 'Passkey authentication cancelled or failed';
+      await db.createAccessLog({
+        employee_ref: null,
+        employee_id: 'UNKNOWN',
+        employee_name: 'Unknown passkey attempt',
+        role: 'Unknown',
+        status: 'Denied',
+        reason,
+        auth_method: 'Passkey',
+      });
+      res.status(201).json({ ok: true });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/webauthn/authentication/verify', async (req, res, next) => {
+    try {
+      const challenge = typeof req.body?.challenge === 'string' ? req.body.challenge : '';
+      const response = req.body?.response as AuthenticationResponseJSON | undefined;
+      const pending = pendingWebAuthnChallenges.get(challenge);
+
+      if (!challenge || !pending || pending.expiresAt < Date.now()) {
+        res.status(400).json({ error: 'The fingerprint challenge is missing or expired.' });
+        return;
+      }
+      pendingWebAuthnChallenges.delete(challenge);
+      if (!response) {
+        res.status(400).json({ error: 'Fingerprint authentication response is missing.' });
+        return;
+      }
+
+      const passkey = await db.findPasskeyByCredentialId(response.id);
+      if (!passkey) {
+        await db.createAccessLog({
+          employee_ref: null,
+          employee_id: 'UNKNOWN',
+          employee_name: 'Unknown passkey',
+          role: 'Unknown',
+          status: 'Denied',
+          reason: 'Passkey credential not recognized',
+          auth_method: 'Passkey',
+        });
+        res.status(401).json({ authenticated: false, message: 'Passkey is not registered for any active employee.' });
+        return;
+      }
+
+      const employee = await db.findEmployeeById(passkey.employee_id);
+      if (!employee || !employee.is_active) {
+        await db.createAccessLog({
+          employee_ref: employee?.id ?? passkey.employee_id,
+          employee_id: employee?.employee_id ?? 'UNKNOWN',
+          employee_name: employee?.full_name ?? 'Inactive employee',
+          role: employee?.role ?? 'Unknown',
+          status: 'Denied',
+          reason: 'Account inactive',
+          auth_method: 'Passkey',
+        });
+        res.status(403).json({ authenticated: false, message: 'This employee account is inactive.' });
+        return;
+      }
+
+      let verification;
+      try {
+        verification = await verifyAuthenticationResponse({
+          response,
+          expectedChallenge: pending.challenge,
+          expectedOrigin: WEBAUTHN_ORIGINS,
+          expectedRPID: WEBAUTHN_RP_ID,
+          credential: {
+            id: passkey.credential_id,
+            publicKey: isoBase64URL.toBuffer(passkey.public_key),
+            counter: passkey.counter,
+            transports: passkey.transports as never[],
+          },
+          requireUserVerification: true,
+        });
+      } catch {
+        await db.createAccessLog({
+          employee_ref: employee.id,
+          employee_id: employee.employee_id,
+          employee_name: employee.full_name,
+          role: employee.role,
+          status: 'Denied',
+          reason: 'Invalid passkey authentication response',
+          auth_method: 'Passkey',
+        });
+        res.status(400).json({ authenticated: false, message: 'Invalid fingerprint authentication response.' });
+        return;
+      }
+
+      if (!verification.verified) {
+        await db.createAccessLog({
+          employee_ref: employee.id,
+          employee_id: employee.employee_id,
+          employee_name: employee.full_name,
+          role: employee.role,
+          status: 'Denied',
+          reason: 'Passkey verification failed',
+          auth_method: 'Passkey',
+        });
+        res.status(401).json({ authenticated: false, message: 'Fingerprint verification failed.' });
+        return;
+      }
+
+      await db.updatePasskeyCounter(passkey.credential_id, verification.authenticationInfo.newCounter);
+      await db.createAccessLog({
+        employee_ref: employee.id,
+        employee_id: employee.employee_id,
+        employee_name: employee.full_name,
+        role: employee.role,
+        status: 'Granted',
+        reason: 'Passkey and device biometric verification succeeded',
+        auth_method: 'Passkey',
+      });
+
+      simulationOverriddenLocked = false;
+      const sessionUser: SessionUser = {
+        id: employee.id,
+        employee_id: employee.employee_id,
+        full_name: employee.full_name,
+        role: employee.role,
+      };
+      setSessionCookie(res, createSessionToken(sessionUser, SESSION_SECRET));
+      res.json({
+        authenticated: true,
+        message: 'Fingerprint authentication succeeded.',
+        user: sessionUser,
+        decision: 'GRANTED',
+        doorStatus: 'UNLOCKED',
+      });
+    } catch (err) {
+      next(err);
+    }
   });
 
   app.get('/api/employees/active', requireAuthenticated, async (_req, res, next) => {
@@ -163,6 +484,7 @@ async function startServer() {
         role: employee ? employee.role : 'Unknown',
         status: evaluation.status,
         reason: evaluation.reason,
+        auth_method: 'Password',
       });
 
       if (!evaluation.granted || !employee) {

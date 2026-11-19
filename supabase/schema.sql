@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS public.access_logs (
   employee_id text NOT NULL,
   employee_name text NOT NULL,
   role text NOT NULL,
-  auth_method text NOT NULL DEFAULT 'Password' CHECK (auth_method = 'Password'),
+  auth_method text NOT NULL DEFAULT 'Password' CHECK (auth_method IN ('Password', 'Passkey')),
   status text NOT NULL CHECK (status IN ('Granted', 'Denied')),
   reason text NOT NULL DEFAULT '',
   created_at timestamptz NOT NULL DEFAULT now()
@@ -82,3 +82,34 @@ CREATE POLICY "Deny public access to access_logs"
   TO anon, authenticated
   USING (false)
   WITH CHECK (false);
+
+-- 5. WebAuthn passkey credentials
+CREATE TABLE IF NOT EXISTS public.passkey_credentials (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  employee_id uuid NOT NULL REFERENCES public.employees(id) ON DELETE CASCADE,
+  credential_id text NOT NULL UNIQUE,
+  public_key text NOT NULL,
+  counter bigint NOT NULL DEFAULT 0,
+  transports text[] NOT NULL DEFAULT '{}',
+  device_name text NOT NULL DEFAULT 'Android passkey',
+  backup_eligible boolean NOT NULL DEFAULT false,
+  backup_state boolean NOT NULL DEFAULT false,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  last_used_at timestamptz
+);
+
+CREATE INDEX IF NOT EXISTS idx_passkey_credentials_employee_id
+  ON public.passkey_credentials(employee_id);
+
+ALTER TABLE public.passkey_credentials ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Deny public access to passkey_credentials" ON public.passkey_credentials;
+CREATE POLICY "Deny public access to passkey_credentials"
+  ON public.passkey_credentials
+  FOR ALL
+  TO anon, authenticated
+  USING (false)
+  WITH CHECK (false);
+
+GRANT ALL PRIVILEGES ON TABLE public.passkey_credentials TO service_role;
+REVOKE ALL ON TABLE public.passkey_credentials FROM anon;
+REVOKE ALL ON TABLE public.passkey_credentials FROM authenticated;

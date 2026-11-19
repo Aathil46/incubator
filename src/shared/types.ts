@@ -39,10 +39,21 @@ export interface AccessLogEntry {
   employee_id: string;
   employee_name: string;
   role: string;
-  auth_method: 'Password';
+  auth_method: 'Password' | 'Passkey';
   status: AccessStatus;
   reason: string;
   created_at: string;
+}
+
+export interface PasskeyCredentialPublic {
+  id: string;
+  credential_id: string;
+  device_name: string;
+  transports: string[];
+  backup_eligible: boolean;
+  backup_state: boolean;
+  created_at: string;
+  last_used_at: string | null;
 }
 
 export interface SessionUser {

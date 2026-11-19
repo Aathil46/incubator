@@ -6,6 +6,7 @@ import type {
   EmployeePublic,
   EmployeeRecord,
   EmployeeRole,
+  PasskeyCredentialPublic,
 } from '../src/shared/types.ts';
 import { hashPassword } from './security.ts';
 
@@ -32,6 +33,24 @@ export interface CreateAccessLogParams {
   role: string;
   status: AccessStatus;
   reason: string;
+  auth_method?: 'Password' | 'Passkey';
+}
+
+export interface PasskeyCredentialRecord extends PasskeyCredentialPublic {
+  employee_id: string;
+  public_key: string;
+  counter: number;
+}
+
+export interface StorePasskeyParams {
+  employee_id: string;
+  credential_id: string;
+  public_key: string;
+  counter: number;
+  transports: string[];
+  device_name: string;
+  backup_eligible: boolean;
+  backup_state: boolean;
 }
 
 export interface DatabaseStore {
@@ -50,6 +69,12 @@ export interface DatabaseStore {
   createAccessLog(params: CreateAccessLogParams): Promise<AccessLogEntry>;
   deleteAccessLog(id: string): Promise<boolean>;
   clearAccessLogs(): Promise<number>;
+  listPasskeys(employeeId: string): Promise<PasskeyCredentialPublic[]>;
+  findPasskeyByCredentialId(credentialId: string): Promise<PasskeyCredentialRecord | null>;
+  listPasskeysWithCredentials(): Promise<PasskeyCredentialRecord[]>;
+  storePasskey(params: StorePasskeyParams): Promise<PasskeyCredentialPublic>;
+  updatePasskeyCounter(credentialId: string, counter: number): Promise<void>;
+  deletePasskey(employeeId: string, credentialId: string): Promise<boolean>;
 }
 
 class SupabaseStore implements DatabaseStore {
@@ -267,7 +292,7 @@ class SupabaseStore implements DatabaseStore {
         employee_id: params.employee_id,
         employee_name: params.employee_name,
         role: params.role,
-        auth_method: 'Password',
+        auth_method: params.auth_method ?? 'Password',
         status: params.status,
         reason: params.reason,
       })
@@ -298,6 +323,72 @@ class SupabaseStore implements DatabaseStore {
 
     if (error) throw new Error(error.message);
     return Array.isArray(data) ? data.length : 0;
+  }
+
+  async listPasskeys(employeeId: string): Promise<PasskeyCredentialPublic[]> {
+    const { data, error } = await this.client
+      .from('passkey_credentials')
+      .select('id, credential_id, device_name, transports, backup_eligible, backup_state, created_at, last_used_at')
+      .eq('employee_id', employeeId)
+      .order('created_at', { ascending: false });
+    if (error) throw new Error(error.message);
+    return (data ?? []) as PasskeyCredentialPublic[];
+  }
+
+  async findPasskeyByCredentialId(credentialId: string): Promise<PasskeyCredentialRecord | null> {
+    const { data, error } = await this.client
+      .from('passkey_credentials')
+      .select('*')
+      .eq('credential_id', credentialId)
+      .maybeSingle();
+    if (error) throw new Error(error.message);
+    return (data as PasskeyCredentialRecord | null) ?? null;
+  }
+
+  async listPasskeysWithCredentials(): Promise<PasskeyCredentialRecord[]> {
+    const { data, error } = await this.client
+      .from('passkey_credentials')
+      .select('*');
+    if (error) throw new Error(error.message);
+    return (data ?? []) as PasskeyCredentialRecord[];
+  }
+
+  async storePasskey(params: StorePasskeyParams): Promise<PasskeyCredentialPublic> {
+    const { data, error } = await this.client
+      .from('passkey_credentials')
+      .insert({
+        employee_id: params.employee_id,
+        credential_id: params.credential_id,
+        public_key: params.public_key,
+        counter: params.counter,
+        transports: params.transports,
+        device_name: params.device_name,
+        backup_eligible: params.backup_eligible,
+        backup_state: params.backup_state,
+      })
+      .select('id, credential_id, device_name, transports, backup_eligible, backup_state, created_at, last_used_at')
+      .single();
+    if (error) throw new Error(error.message);
+    return data as PasskeyCredentialPublic;
+  }
+
+  async updatePasskeyCounter(credentialId: string, counter: number): Promise<void> {
+    const { error } = await this.client
+      .from('passkey_credentials')
+      .update({ counter, last_used_at: new Date().toISOString() })
+      .eq('credential_id', credentialId);
+    if (error) throw new Error(error.message);
+  }
+
+  async deletePasskey(employeeId: string, credentialId: string): Promise<boolean> {
+    const { data, error } = await this.client
+      .from('passkey_credentials')
+      .delete()
+      .eq('employee_id', employeeId)
+      .eq('credential_id', credentialId)
+      .select('id');
+    if (error) throw new Error(error.message);
+    return Array.isArray(data) && data.length > 0;
   }
 }
 

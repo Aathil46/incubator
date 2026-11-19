@@ -4,12 +4,20 @@ import {
   CheckCircle2,
   Eye,
   EyeOff,
+  Fingerprint,
   KeyRound,
   Lock,
+  Trash2,
   UserCheck,
 } from 'lucide-react';
 import { useEffect, useState, type FormEvent } from 'react';
-import type { ActiveEmployeeOption, LoginResponse, SessionUser } from '../shared/types';
+import { startAuthentication, startRegistration } from '@simplewebauthn/browser';
+import type {
+  ActiveEmployeeOption,
+  LoginResponse,
+  PasskeyCredentialPublic,
+  SessionUser,
+} from '../shared/types';
 import { api } from '../utils/api';
 import type { NavSectionId } from './TopNav';
 
@@ -44,6 +52,9 @@ export function EmployeeAuthView({
     message: string;
     user?: SessionUser;
   } | null>(null);
+  const [passkeys, setPasskeys] = useState<PasskeyCredentialPublic[]>([]);
+  const [passkeyBusy, setPasskeyBusy] = useState(false);
+  const [passkeyMessage, setPasskeyMessage] = useState<string | null>(null);
 
   const fetchActiveEmployees = async () => {
     setLoadingEmployees(true);
@@ -64,6 +75,16 @@ export function EmployeeAuthView({
   useEffect(() => {
     fetchActiveEmployees();
   }, []);
+
+  useEffect(() => {
+    if (!sessionUser) {
+      setPasskeys([]);
+      return;
+    }
+    api.getPasskeys()
+      .then(({ passkeys: records }) => setPasskeys(records))
+      .catch(() => setPasskeys([]));
+  }, [sessionUser]);
 
   const handleSubmit = async (event: FormEvent) => {
     event.preventDefault();
@@ -111,6 +132,92 @@ export function EmployeeAuthView({
       });
     } finally {
       setSubmitting(false);
+    }
+  };
+
+  const handlePasskeyLogin = async () => {
+    setPasskeyBusy(true);
+    setPasskeyMessage(null);
+    setAuthResult(null);
+    try {
+      if (!window.PublicKeyCredential) {
+        throw new Error('This device or browser does not support passkeys.');
+      }
+      const { options } = await api.getPasskeyAuthenticationOptions();
+      const optionsJSON = options as Parameters<typeof startAuthentication>[0]['optionsJSON'];
+      const challenge = String(optionsJSON.challenge);
+      const response = await startAuthentication({ optionsJSON });
+      const result = await api.verifyPasskeyAuthentication(challenge, response);
+      if (result.authenticated && result.user) {
+        setAuthResult({
+          type: 'success',
+          message: result.message,
+          user: result.user,
+        });
+        onAuthSuccess(result.user, result as LoginResponse);
+      } else {
+        setAuthResult({ type: 'error', message: result.message });
+      }
+    } catch (err) {
+      const message =
+        err instanceof Error
+          ? err.message
+          : 'Fingerprint authentication could not be completed.';
+      void api.recordPasskeyFailure(
+        message.includes('cancel')
+          ? 'Passkey authentication cancelled'
+          : 'Passkey authentication unavailable or failed',
+      ).catch(() => undefined);
+      setPasskeyMessage(message);
+      setAuthResult({
+        type: 'error',
+        message:
+          message.includes('cancel')
+            ? 'Fingerprint verification was cancelled.'
+            : 'Fingerprint login failed. Use your Employee ID and password instead.',
+      });
+    } finally {
+      setPasskeyBusy(false);
+    }
+  };
+
+  const handleRegisterPasskey = async () => {
+    setPasskeyBusy(true);
+    setPasskeyMessage(null);
+    try {
+      if (!window.PublicKeyCredential) {
+        throw new Error('This device or browser does not support passkeys.');
+      }
+      const { options } = await api.getPasskeyRegistrationOptions();
+      const optionsJSON = options as Parameters<typeof startRegistration>[0]['optionsJSON'];
+      const challenge = String(optionsJSON.challenge);
+      const response = await startRegistration({ optionsJSON });
+      await api.verifyPasskeyRegistration(challenge, response);
+      const { passkeys: records } = await api.getPasskeys();
+      setPasskeys(records);
+      setPasskeyMessage('Passkey registered securely on this device.');
+    } catch (err) {
+      setPasskeyMessage(
+        err instanceof Error
+          ? err.message
+          : 'Passkey registration could not be completed.',
+      );
+    } finally {
+      setPasskeyBusy(false);
+    }
+  };
+
+  const handleRemovePasskey = async (credentialId: string) => {
+    setPasskeyBusy(true);
+    setPasskeyMessage(null);
+    try {
+      await api.deletePasskey(credentialId);
+      setPasskeys((current) => current.filter((passkey) => passkey.credential_id !== credentialId));
+      setPasskeyMessage('Passkey removed from this account.');
+    } catch (err) {
+      setPasskeyMessage(err instanceof Error ? err.message : 'Unable to remove passkey.');
+    } finally {
+      setPasskeyBusy(false);
     }
   };
 
@@ -297,6 +404,15 @@ export function EmployeeAuthView({
                 <Lock className="h-4 w-4" aria-hidden="true" />
                 {submitting ? 'Verifying Credentials...' : 'Authenticate & Login'}
               </button>
+              <button
+                type="button"
+                onClick={handlePasskeyLogin}
+                disabled={passkeyBusy}
+                className="inline-flex min-h-11 items-center justify-center gap-2 rounded-lg border border-emerald-300 bg-emerald-50 px-5 py-2.5 text-sm font-semibold text-emerald-800 hover:bg-emerald-100 disabled:opacity-60 transition-colors focus-visible:outline-2 focus-visible:outline-emerald-700"
+              >
+                <Fingerprint className="h-4 w-4" aria-hidden="true" />
+                {passkeyBusy ? 'Checking Passkey...' : 'Login with Fingerprint'}
+              </button>
 
               {authResult?.type === 'success' && (
                 <button
@@ -344,6 +460,60 @@ export function EmployeeAuthView({
                   <dd className="font-semibold text-blue-700">{sessionUser.role}</dd>
                 </div>
               </dl>
+
+              <div className="space-y-3 pt-1">
+                <div className="flex items-center justify-between gap-3">
+                  <p className="text-sm font-semibold text-slate-800">Device Passkeys</p>
+                  <button
+                    type="button"
+                    onClick={handleRegisterPasskey}
+                    disabled={passkeyBusy}
+                    className="inline-flex min-h-10 items-center gap-1.5 rounded-lg bg-emerald-600 px-3 py-2 text-xs font-semibold text-white hover:bg-emerald-700 disabled:opacity-60 transition-colors"
+                  >
+                    <Fingerprint className="h-4 w-4" aria-hidden="true" />
+                    Register Fingerprint
+                  </button>
+                </div>
+
+                {passkeys.length === 0 ? (
+                  <p className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5 text-xs text-slate-600">
+                    No passkeys are registered for this account.
+                  </p>
+                ) : (
+                  <ul className="space-y-2">
+                    {passkeys.map((passkey) => (
+                      <li
+                        key={passkey.id}
+                        className="flex items-center justify-between gap-3 rounded-lg border border-slate-200 px-3 py-2"
+                      >
+                        <div className="min-w-0">
+                          <p className="truncate text-xs font-semibold text-slate-800">
+                            {passkey.device_name}
+                          </p>
+                          <p className="mt-0.5 text-[11px] text-slate-500">
+                            Registered {new Date(passkey.created_at).toLocaleDateString()}
+                          </p>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => handleRemovePasskey(passkey.credential_id)}
+                          disabled={passkeyBusy}
+                          aria-label={`Remove ${passkey.device_name}`}
+                          className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-red-600 hover:bg-red-50 disabled:opacity-60"
+                        >
+                          <Trash2 className="h-4 w-4" aria-hidden="true" />
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+
+                {passkeyMessage && (
+                  <p role="status" className="text-xs font-medium text-slate-700">
+                    {passkeyMessage}
+                  </p>
+                )}
+              </div>
 
               <div className="flex flex-wrap gap-2.5 pt-1">
                 {sessionUser.role === 'Admin' && (

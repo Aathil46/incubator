@@ -89,7 +89,7 @@ export function AccessHistoryView({
             Access History
           </h1>
           <p className="mt-1 text-sm text-slate-600">
-            Audit trail of all incubator room password authentication attempts, ordered newest first.
+            Audit trail of all incubator room password and passkey authentication attempts, ordered newest first.
           </p>
         </div>
 
